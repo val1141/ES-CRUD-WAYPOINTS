@@ -20,6 +20,7 @@ class SchedulePoint(BaseModel):
 class PointUpsertRequest(BaseModel):
     point: SchedulePoint
     command_id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    expected_version: int = Field(..., ge=0, description="The version of the point the client expects to be updating. Use 0 for creating a new point.")
 
 # --- Event Sourcing Models ---
 # EventPayload will be the SchedulePoint itself
