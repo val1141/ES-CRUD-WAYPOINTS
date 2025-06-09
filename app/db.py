@@ -126,3 +126,97 @@ def get_active_points_for_route(client: clickhouse_connect.driver.client.Client,
             points.append(SchedulePoint(**row_dict)) # Assumes SchedulePoint model matches columns
     logger.info(f"Retrieved {len(points)} active points for route_id {route_id}")
     return points
+
+def get_point_events_up_to_version(
+    client: clickhouse_connect.driver.client.Client,
+    route_id: uuid.UUID,
+    point_id: uuid.UUID, # The ID of the point itself, from payload
+    target_version: int
+) -> List[Event]:
+    # We need to filter by point_id within the JSON payload. This can be less efficient.
+    # If this query becomes slow, consider adding point_id as a top-level column in schedule_events,
+    # or creating a materialized view specifically for point history.
+    query = f"""
+    SELECT route_id, version, event_id, command_id, event_type, payload, created_at
+    FROM {settings.CLICKHOUSE_DATABASE}.schedule_events
+    WHERE route_id = %(route_id)s
+      AND toUUID(JSONExtractString(payload, 'id')) = %(point_id)s
+      AND version <= %(target_version)s
+      AND event_type = 'SchedulePointUpserted' -- Assuming only this type modifies point state
+    ORDER BY version ASC
+    """
+    params = {
+        'route_id': str(route_id),
+        'point_id': str(point_id),
+        'target_version': target_version
+    }
+    logger.debug(f"Querying events for point {point_id} on route {route_id} up to version {target_version}: {query} with params {params}")
+    result = client.query(query, parameters=params)
+
+    events = []
+    if result.result_rows:
+        column_names = result.column_names
+        for row_values in result.result_rows:
+            event_dict = dict(zip(column_names, row_values))
+            # Deserialize payload back into a SchedulePoint or keep as string for Event model
+            # The Event model expects payload as a string, so this is fine.
+            events.append(Event(**event_dict))
+    logger.info(f"Retrieved {len(events)} events for point {point_id} on route {route_id} up to version {target_version}.")
+    return events
+
+def reconstruct_point_state_from_events(events: List[Event]) -> Optional[SchedulePoint]:
+    if not events:
+        return None
+
+    # Sort events by version just in case they aren't already (though query does this)
+    # events.sort(key=lambda e: e.version) # Already ordered by query
+
+    current_state_dict = {}
+    for event in events:
+        if event.event_type == "SchedulePointUpserted":
+            try:
+                payload_data = json.loads(event.payload)
+                # Simply override with the new payload. In a more complex system with
+                # different event types (e.g., PointTimeChanged, PointColorChanged),
+                # you'd apply changes more granularly.
+                current_state_dict = payload_data
+            except json.JSONDecodeError:
+                logger.error(f"Failed to decode payload for event {event.event_id} during reconstruction.")
+                continue # or raise error
+        # Add other event_type handling here if applicable
+
+    if not current_state_dict:
+        return None
+
+    # The reconstructed state should have the version of the last event applied.
+    # However, SchedulePoint model itself doesn't have 'version'.
+    # We are returning the state *as of* that version.
+    return SchedulePoint(**current_state_dict)
+
+def get_point_event_history(
+    client: clickhouse_connect.driver.client.Client,
+    route_id: uuid.UUID,
+    point_id: uuid.UUID # The ID of the point itself, from payload
+) -> List[Event]:
+    query = f"""
+    SELECT route_id, version, event_id, command_id, event_type, payload, created_at
+    FROM {settings.CLICKHOUSE_DATABASE}.schedule_events
+    WHERE route_id = %(route_id)s
+      AND toUUID(JSONExtractString(payload, 'id')) = %(point_id)s
+    ORDER BY version ASC
+    """
+    params = {
+        'route_id': str(route_id),
+        'point_id': str(point_id)
+    }
+    logger.debug(f"Querying event history for point {point_id} on route {route_id}: {query} with params {params}")
+    result = client.query(query, parameters=params)
+
+    events = []
+    if result.result_rows:
+        column_names = result.column_names
+        for row_values in result.result_rows:
+            event_dict = dict(zip(column_names, row_values))
+            events.append(Event(**event_dict))
+    logger.info(f"Retrieved {len(events)} events for history of point {point_id} on route {route_id}.")
+    return events

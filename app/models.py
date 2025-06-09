@@ -49,3 +49,6 @@ class SchedulePointResponse(SchedulePoint):
     # In this case, it's identical to SchedulePoint,
     # but defined for clarity and future extensibility if response differs.
     pass
+
+class RevertCommand(BaseModel):
+    command_id: uuid.UUID = Field(default_factory=uuid.uuid4)
