@@ -2,15 +2,18 @@ import uuid
 import json
 import logging
 from fastapi import FastAPI, HTTPException, Depends, status, Path as FastAPIPath
-from typing import List
+from typing import List, Optional
 
-from app.models import PointUpsertRequest, Event, SchedulePoint, SchedulePointResponse
+from app.models import PointUpsertRequest, Event, SchedulePoint, SchedulePointResponse, RevertCommand
 from app.db import (
     get_clickhouse_client,
     store_event_in_db,
     get_current_point_version_and_command,
     check_command_id_globally_processed,
-    get_active_points_for_route
+    get_active_points_for_route,
+    get_point_events_up_to_version,
+    reconstruct_point_state_from_events,
+    get_point_event_history
 )
 from app.config import settings
 import clickhouse_connect
@@ -131,7 +134,113 @@ async def get_route_points(
         logger.error(f"Error retrieving points for route_id {route_id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-# For local development without Docker, if needed:
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(app, host=settings.APP_HOST, port=settings.APP_PORT)
+@app.get("/routes/{route_id}/points/{point_id}/versions/{version}", response_model=Optional[SchedulePointResponse])
+async def get_point_at_version(
+    route_id: uuid.UUID = FastAPIPath(..., description="Route ID"),
+    point_id: uuid.UUID = FastAPIPath(..., description="Schedule Point ID"),
+    version: int = FastAPIPath(..., description="Target version number", ge=1),
+    client: clickhouse_connect.driver.client.Client = Depends(get_db)
+):
+    """
+    Retrieves the state of a specific SchedulePoint for a given route
+    as it was at the specified version.
+    """
+    logger.info(f"Request to get point {point_id} on route {route_id} at version {version}")
+    try:
+        events = get_point_events_up_to_version(client, route_id, point_id, version)
+        if not events:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                                detail=f"No events found for point {point_id} on route {route_id} up to version {version}, or point does not exist.")
+
+        reconstructed_state = reconstruct_point_state_from_events(events)
+        if not reconstructed_state:
+            # This case should ideally be caught by 'if not events' unless reconstruction fails weirdly
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                                detail=f"Could not reconstruct state for point {point_id} on route {route_id} at version {version}.")
+
+        return reconstructed_state # Pydantic will serialize SchedulePoint to SchedulePointResponse
+    except HTTPException:
+        raise # Re-raise HTTPException to preserve status code and detail
+    except Exception as e:
+        logger.error(f"Error getting point {point_id} at version {version}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    
+@app.get("/routes/{route_id}/points/{point_id}/history", response_model=List[Event])
+async def get_point_history(
+    route_id: uuid.UUID = FastAPIPath(..., description="Route ID"),
+    point_id: uuid.UUID = FastAPIPath(..., description="Schedule Point ID"),
+    client: clickhouse_connect.driver.client.Client = Depends(get_db)
+):
+    """
+    Retrieves the complete event history for a specific SchedulePoint on a given route.
+    """
+    logger.info(f"Request for event history of point {point_id} on route {route_id}")
+    try:
+        events = get_point_event_history(client, route_id, point_id)
+        # If no events, an empty list is a valid response
+        return events
+    except Exception as e:
+        logger.error(f"Error getting history for point {point_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    
+@app.post("/routes/{route_id}/points/{point_id}/revert-to-version/{target_version}",
+           status_code=status.HTTP_202_ACCEPTED,
+           response_model=Event)
+async def revert_point_to_version(
+    revert_command: RevertCommand, # Body parameter moved first (among those that can be reordered)
+    route_id: uuid.UUID = FastAPIPath(..., description="Route ID"),
+    point_id: uuid.UUID = FastAPIPath(..., description="Schedule Point ID"),
+    target_version: int = FastAPIPath(..., description="Version to revert to", ge=1),
+    client: clickhouse_connect.driver.client.Client = Depends(get_db) # Default argument last
+):
+    # ... rest of the function body remains the same
+    command_id = revert_command.command_id
+    logger.info(f"Received revert command {command_id} for point {point_id} on route {route_id} to version {target_version}")
+
+    # Idempotency Check (optional, similar to upsert)
+    if check_command_id_globally_processed(client, command_id):
+        logger.warning(f"Revert Command ID {command_id} has been processed before. Proceeding.")
+
+    try:
+        current_mv_version, _ = get_current_point_version_and_command(client, route_id, point_id)
+        if current_mv_version == 0:
+             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                                detail=f"Point {point_id} on route {route_id} not found.")
+        if target_version >= current_mv_version: # target_version must be strictly less
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"Target version {target_version} must be less than current version {current_mv_version}. Point not found or target is not historical.")
+
+        historical_events = get_point_events_up_to_version(client, route_id, point_id, target_version)
+        if not historical_events: # Should not happen if target_version < current_mv_version and point exists
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                                detail=f"No history found for point {point_id} up to version {target_version}.")
+
+        state_to_revert_to = reconstruct_point_state_from_events(historical_events)
+        if not state_to_revert_to:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail=f"Could not reconstruct state for point {point_id} at version {target_version}.")
+
+        if state_to_revert_to.id != point_id or state_to_revert_to.route_id != route_id:
+             logger.error(f"Mismatch in reconstructed state IDs: payload has {state_to_revert_to.id}/{state_to_revert_to.route_id}, expected {point_id}/{route_id}")
+             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="State reconstruction ID mismatch.")
+
+        next_event_version = current_mv_version + 1
+        
+        revert_event = Event(
+            route_id=route_id,
+            version=next_event_version,
+            command_id=command_id,
+            event_type="SchedulePointUpserted",
+            payload=state_to_revert_to.model_dump_json(),
+        )
+
+        store_event_in_db(client, revert_event)
+        logger.info(f"Revert Event {revert_event.event_id} (new v{next_event_version}) stored for point {point_id}, reverting to state of v{target_version}.")
+
+        return revert_event
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing revert command {command_id} for point {point_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
