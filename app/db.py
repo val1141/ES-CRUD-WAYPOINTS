@@ -28,23 +28,36 @@ def get_clickhouse_client():
         raise
 
 def get_current_point_version_and_command(client: clickhouse_connect.driver.client.Client, route_id: uuid.UUID, point_id: uuid.UUID) -> Tuple[int, Optional[uuid.UUID]]:
+    # Этот запрос остается БЕЗ FINAL для производительности на пути записи.
     query = f"""
     SELECT version
     FROM {settings.CLICKHOUSE_DATABASE}.schedule_points
     WHERE route_id = %(route_id)s AND id = %(point_id)s
-    ORDER BY version DESC
-    LIMIT 1
+    ORDER BY version DESC 
+    LIMIT 1 
     """
+    # Важное примечание: ORDER BY version DESC LIMIT 1 на ReplacingMergeTree без FINAL
+    # может вернуть не самую "абсолютно последнюю" версию, если есть несколько не смерженных частей
+    # с разными версиями одного и того же ключа. Он вернет максимальную версию из тех частей,
+    # которые он просмотрел. Для optimistic locking это обычно достаточно, так как любая
+    # конкурирующая запись УВЕЛИЧИТ версию. Если эта "не самая последняя" версия все еще
+    # совпадает с expected_version клиента, а на самом деле есть еще более новая, то
+    # expected_version клиента уже неверна по отношению к истинно последней.
+    # Если же он вернет версию, которая уже выше expected_version, лок сработает.
+    # Для более строгой проверки версии для optimistic lock можно было бы читать максимальную версию
+    # из таблицы событий, но это дороже.
+
     params = {'route_id': str(route_id), 'point_id': str(point_id)}
-    logger.debug(f"Querying current version: {query} with params: {params}")
+    logger.debug(f"Querying current version (for optimistic lock, NO FINAL): {query} with params: {params}")
     result = client.query(query, parameters=params)
 
     if result.result_rows:
         current_version = result.first_row[0]
-        logger.debug(f"Current version for point {point_id} on route {route_id} is {current_version}")
+        logger.debug(f"Current version for point {point_id} on route {route_id} (from MV, no FINAL) is {current_version}")
         return current_version, None
-    logger.debug(f"No existing version for point {point_id} on route {route_id}. Starting at version 0 (next will be 1).")
+    logger.debug(f"No existing version for point {point_id} on route {route_id} (from MV, no FINAL). Starting at version 0.")
     return 0, None
+
 
 def check_command_id_globally_processed(client: clickhouse_connect.driver.client.Client, command_id: uuid.UUID) -> bool:
     query = f"""
@@ -90,6 +103,7 @@ def store_event_in_db(client: clickhouse_connect.driver.client.Client, event: Ev
         raise
 
 def get_active_points_for_route(client: clickhouse_connect.driver.client.Client, route_id: uuid.UUID) -> List[SchedulePoint]:
+    # Добавляем FINAL к запросу для принудительной дедупликации ReplacingMergeTree во время чтения
     query = f"""
     SELECT
         id,
@@ -102,29 +116,29 @@ def get_active_points_for_route(client: clickhouse_connect.driver.client.Client,
         override_color,
         route_changed_at,
         is_deleted
-    FROM {settings.CLICKHOUSE_DATABASE}.schedule_points
+        -- Обратите внимание: столбец version из schedule_points здесь не выбирается,
+        -- но он используется ReplacingMergeTree для своей логики.
+        -- Если бы он был нужен клиенту, его можно было бы добавить.
+    FROM {settings.CLICKHOUSE_DATABASE}.schedule_points FINAL -- <--- ДОБАВЛЕНО FINAL
     WHERE route_id = %(route_id)s AND is_deleted = 0
-    ORDER BY time, id
+    ORDER BY time, id -- Или другая логичная сортировка для списка точек
     """
     params = {'route_id': str(route_id)}
-    logger.debug(f"Querying active points for route: {query} with params: {params}")
+    logger.debug(f"Querying active points for route (WITH FINAL): {query} with params: {params}")
+    
     result = client.query(query, parameters=params)
 
     points = []
     if result.result_rows:
-        # For clickhouse-connect, result.column_names gives the names
-        # and result.result_rows gives list of tuples (rows)
         column_names = result.column_names
         for row_values in result.result_rows:
             row_dict = dict(zip(column_names, row_values))
-            # Ensure boolean fields are correctly typed from UInt8 if necessary
-            # (Pydantic usually handles this if types are correct, but good to be explicit if issues arise)
             if 'is_additional_trip' in row_dict:
                  row_dict['is_additional_trip'] = bool(row_dict['is_additional_trip'])
             if 'is_deleted' in row_dict:
                  row_dict['is_deleted'] = bool(row_dict['is_deleted'])
-            points.append(SchedulePoint(**row_dict)) # Assumes SchedulePoint model matches columns
-    logger.info(f"Retrieved {len(points)} active points for route_id {route_id}")
+            points.append(SchedulePoint(**row_dict))
+    logger.info(f"Retrieved {len(points)} active points (using FINAL) for route_id {route_id}")
     return points
 
 def get_point_events_up_to_version(
