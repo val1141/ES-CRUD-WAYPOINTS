@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+clickhouse-connect
+pydantic>=2.0
+pydantic-settings 
+python-dateutil

@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  clickhouse-server:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse-scheduler-es
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - ./init_clickhouse:/docker-entrypoint-initdb.d
+      - clickhouse_schedule_data:/var/lib/clickhouse
+      - clickhouse_schedule_logs:/var/log/clickhouse-server
+    environment:
+      - CLICKHOUSE_DB=schedule_service_db
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=lewa
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:8123/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fastapi-scheduler-es-app
+    ports:
+      - "8000:8000"
+    environment:
+      - CLICKHOUSE_HOST=clickhouse-server
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=lewa
+      - CLICKHOUSE_DATABASE=schedule_service_db
+    depends_on:
+      clickhouse-server:
+        condition: service_healthy
+    volumes:
+      - ./app:/usr/src/app/app
+
+volumes:
+  clickhouse_schedule_data:
+  clickhouse_schedule_logs:
