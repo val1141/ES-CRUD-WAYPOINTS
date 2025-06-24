@@ -2,6 +2,7 @@ import uuid
 import json
 import logging
 from fastapi import FastAPI, HTTPException, Depends, status, Path as FastAPIPath
+from fastapi.responses import JSONResponse
 from typing import List, Optional
 
 from app.models import PointUpsertRequest, Event, SchedulePoint, SchedulePointResponse, RevertCommand
@@ -17,11 +18,27 @@ from app.db import (
 )
 from app.config import settings
 import clickhouse_connect
+from clickhouse_connect.driver.exceptions import Error as ClickHouseError
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="SchedulePoint Service with Event Sourcing")
+
+# Generic handler for ClickHouse errors to return cleaner API responses
+@app.exception_handler(ClickHouseError)
+async def clickhouse_error_handler(request, exc: ClickHouseError):
+    """Return a sanitized response when ClickHouse interaction fails."""
+    logger.error(f"Database error: {exc}", exc_info=True)
+    # Map common not-found messages to 404, otherwise 500
+    message = str(exc).lower()
+    if "doesn't exist" in message or "not found" in message:
+        status_code = status.HTTP_404_NOT_FOUND
+        detail = "Requested resource not found"
+    else:
+        status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        detail = "Database error"
+    return JSONResponse(status_code=status_code, content={"detail": detail})
 
 # Dependency for ClickHouse client
 def get_db():
@@ -160,8 +177,11 @@ async def get_route_points(
     logger.info(f"Request to get active points for route_id: {route_id}")
     try:
         points = get_active_points_for_route(client, route_id)
-        # No special handling for "not found" needed if an empty list is acceptable.
-        # If route_id itself must exist, additional checks might be needed.
+        if not points:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No points found for route {route_id}",
+            )
         return points
     except Exception as e:
         logger.error(f"Error retrieving points for route_id {route_id}: {e}", exc_info=True)
@@ -210,7 +230,11 @@ async def get_point_history(
     logger.info(f"Request for event history of point {point_id} on route {route_id}")
     try:
         events = get_point_event_history(client, route_id, point_id)
-        # If no events, an empty list is a valid response
+        if not events:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No history found for point {point_id} on route {route_id}",
+            )
         return events
     except Exception as e:
         logger.error(f"Error getting history for point {point_id}: {e}", exc_info=True)
