@@ -157,6 +157,8 @@ async def upsert_point(
     except HTTPException:
         # Перебрасываем HTTPException, чтобы сохранить статус код и детали
         raise
+    except ClickHouseError:
+        raise
     except Exception as e:
         logger.error(f"Unexpected error processing command {command_id} for point {point_id}: {e}", exc_info=True)
         raise HTTPException(
@@ -183,9 +185,17 @@ async def get_route_points(
                 detail=f"No points found for route {route_id}",
             )
         return points
+    except HTTPException:
+        raise
+    except ClickHouseError:
+        raise
     except Exception as e:
-        logger.error(f"Error retrieving points for route_id {route_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+        logger.error(
+            f"Error retrieving points for route_id {route_id}: {e}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
 
 @app.get("/routes/{route_id}/points/{point_id}/versions/{version}", response_model=Optional[SchedulePointResponse])
 async def get_point_at_version(
@@ -214,6 +224,8 @@ async def get_point_at_version(
         return reconstructed_state # Pydantic will serialize SchedulePoint to SchedulePointResponse
     except HTTPException:
         raise # Re-raise HTTPException to preserve status code and detail
+    except ClickHouseError:
+        raise
     except Exception as e:
         logger.error(f"Error getting point {point_id} at version {version}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
@@ -236,9 +248,17 @@ async def get_point_history(
                 detail=f"No history found for point {point_id} on route {route_id}",
             )
         return events
+    except HTTPException:
+        raise
+    except ClickHouseError:
+        raise
     except Exception as e:
-        logger.error(f"Error getting history for point {point_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+        logger.error(
+            f"Error getting history for point {point_id}: {e}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
     
 @app.post("/routes/{route_id}/points/{point_id}/revert-to-version/{target_version}",
            status_code=status.HTTP_202_ACCEPTED,
@@ -297,6 +317,8 @@ async def revert_point_to_version(
         return revert_event
 
     except HTTPException:
+        raise
+    except ClickHouseError:
         raise
     except Exception as e:
         logger.error(f"Error processing revert command {command_id} for point {point_id}: {e}", exc_info=True)
